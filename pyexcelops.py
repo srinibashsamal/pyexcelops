@@ -1,5 +1,5 @@
 """
-excel_ops.py
+pyexcelops.py
 ==================
 A utility for writing multiple pandas DataFrames to a single, consistently
 formatted Excel workbook (.xlsx).
