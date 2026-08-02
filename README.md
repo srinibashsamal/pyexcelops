@@ -37,5 +37,5 @@ It automatically applies consistent styling, auto-adjusts column widths, support
 Clone the repository:
 
 ```bash
-git clone https://github.com/<your-username>/pyexcelops.git
+git clone https://github.com/srinibashsamal/pyexcelops.git
 cd pyexcelops
