@@ -44,6 +44,9 @@ _FONT_NAME: str = "Calibri"
 _DEFAULT_TABLE_STYLE: str = "TableStyleMedium1"
 _NO_DATA_MESSAGE: str = "This sheet contains no data based on the current inputs!"
 _FILTER_ICON_WIDTH: float = 3
+_MAX_SAMPLE_SIZE: int = 1000
+_MAX_SHEET_NAME_LEN: int = 31
+_INVALID_SHEET_NAME_CHARS: str = r"[:\\/?*\[\]]"
 
 
 # ---------------------------------------------------------------------------
@@ -79,13 +82,20 @@ def _calc_column_width(
     if series.empty:
         return min(len(header) + padding, max_width)
 
-    max_len = max(series.astype(str).str.len().max(), len(header))
-    return min(max_len + padding, max_width)
+    # Sample large series to avoid expensive string conversion on every row
+    sample = series.dropna().astype(str)
+    if sample.empty:
+        return min(len(header) + padding, max_width)
+    if len(sample) > _MAX_SAMPLE_SIZE:
+        sample = sample.sample(_MAX_SAMPLE_SIZE, random_state=42)
+
+    max_len = int(sample.str.len().max())
+    return min(max(max_len, len(header)) + padding, max_width)
 
 
 def _sanitize_table_name(name: str) -> str:
     """
-    Produce a valid Excel table ``displayName``:
+    Produce a valid Excel table `displayName`:
     no spaces, must start with a letter or underscore, max 255 chars.
     """
     base = re.sub(r"[^A-Za-z0-9_]", "_", name.strip()) or "Table"
@@ -95,7 +105,7 @@ def _sanitize_table_name(name: str) -> str:
 
 
 def _unique_table_name(workbook, desired: str) -> str:
-    """Return *desired* if it is not already used in *workbook*, otherwise append ``_2``, ``_3``, …"""
+    """Return *desired* if it is not already used in *workbook*, otherwise append `_2`, `_3`, …"""
     existing: set[str] = set()
     for ws in workbook.worksheets:
         existing.update(ws.tables.keys())
@@ -107,11 +117,61 @@ def _unique_table_name(workbook, desired: str) -> str:
     return f"{desired}_{i}"
 
 
+def _sanitize_sheet_name(name: str, index: int) -> str:
+    """
+    Produce a valid Excel worksheet name.
+
+    Excel worksheet names cannot exceed 31 characters and cannot contain
+    any of: `: \\ / ? * [ ]`. Invalid characters are replaced with an
+    underscore, and overly long names are trimmed to fit, with a message
+    printed to inform the caller.
+    """
+    original = name
+    cleaned = re.sub(_INVALID_SHEET_NAME_CHARS, "_", name.strip())
+
+    if not cleaned:
+        cleaned = f"Sheet{index + 1}"
+
+    if cleaned != original.strip():
+        print(
+            f"Sheet name '{original}' contains characters not allowed by Excel "
+            f"(: \\ / ? * [ ]); replaced with underscores -> '{cleaned}'"
+        )
+
+    if len(cleaned) > _MAX_SHEET_NAME_LEN:
+        trimmed = cleaned[:_MAX_SHEET_NAME_LEN]
+        print(
+            f"Sheet name '{cleaned}' cannot be longer than {_MAX_SHEET_NAME_LEN} "
+            f"characters; trimmed to '{trimmed}'"
+        )
+        cleaned = trimmed
+
+    return cleaned
+
+
+def _unique_sheet_name(desired: str, used: set) -> str:
+    """
+    Return *desired* if not already in *used*, otherwise append a numeric
+    suffix (`_2`, `_3`, …), trimming as needed to respect the 31-char
+    Excel worksheet-name limit.
+    """
+    if desired not in used:
+        return desired
+
+    i = 2
+    while True:
+        suffix = f"_{i}"
+        candidate = desired[: _MAX_SHEET_NAME_LEN - len(suffix)] + suffix
+        if candidate not in used:
+            return candidate
+        i += 1
+
+
 def _apply_wrap_row_heights(
     ws,
     min_row: int,
     max_row: int,
-    wrap_cols: List[int],
+    wrap_col_widths: Dict[int, float],
     base_line_height: float = 15.0,
     min_height: float = 15.0,
     max_height: float = 240.0,
@@ -119,30 +179,33 @@ def _apply_wrap_row_heights(
     """
     Heuristically set row heights for rows that contain wrapped text.
 
-    Estimates the number of visible lines per cell from the column width and
-    the length of the cell value, then sets the row height accordingly.
-    """
-    if not wrap_cols:
-        return
+    Estimates the number of visible lines per cell from the column's
+    *content* width (excluding any filter-icon padding) and the length of
+    the cell value, then sets the row height accordingly.
 
-    # Cache column widths (Excel default ≈ 8.43 if not explicitly set).
-    col_widths: Dict[int, float] = {}
-    for col_idx in wrap_cols:
-        raw = ws.column_dimensions[get_column_letter(col_idx)].width
-        col_widths[col_idx] = float(raw) if raw else 8.43
+    Args:
+        wrap_col_widths: mapping of column index -> content width (in Excel
+            character units, not including filter-icon padding) to use when
+            estimating characters-per-line. Using the unpadded content width
+            (rather than re-reading the padded column width straight off the
+            sheet) avoids overestimating characters-per-line and therefore
+            underestimating how many lines a cell will actually wrap to.
+    """
+    if not wrap_col_widths:
+        return
 
     fudge = 1.05  # slight under-estimation guard
 
     for row_num in range(min_row, max_row + 1):
         needed_lines = 1
 
-        for col_idx in wrap_cols:
+        for col_idx, col_width in wrap_col_widths.items():
             cell = ws.cell(row=row_num, column=col_idx)
             text = str(cell.value) if cell.value is not None else ""
             if not text:
                 continue
 
-            chars_per_line = max(int(col_widths[col_idx] / fudge), 5)
+            chars_per_line = max(int(col_width / fudge), 5)
             lines_for_cell = sum(
                 max(1, math.ceil(len(para) / chars_per_line)) if para else 1
                 for para in text.split("\n")
@@ -154,15 +217,30 @@ def _apply_wrap_row_heights(
         )
 
 
-def _write_empty_sheet(
-    ws, ncols: int, styles: Dict[str, Any], wrap_threshold: int
-) -> None:
+def _apply_header_styles(ws, ncols: int, styles: Dict[str, Any]) -> None:
+    """Apply custom header styling to row 1 of a worksheet."""
+    for col_idx in range(1, ncols + 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.font = styles["header_font"]
+        cell.fill = styles["header_fill"]
+        cell.alignment = styles["header_align"]
+        cell.border = styles["thin_border"]
+
+
+def _write_empty_sheet(ws, ncols: int, styles: Dict[str, Any], max_width: int) -> None:
     """Write a 'no data' notice on a sheet that has headers but zero data rows."""
     if ncols == 0:
         ws["A1"] = _NO_DATA_MESSAGE
         ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
         ws["A1"].font = Font(name=_FONT_NAME, italic=True, color=_NAVY_BLUE)
         return
+
+    # Style the existing header row (already written by df.to_excel)
+    for header_cell in ws[1]:
+        header_cell.font = styles["header_font"]
+        header_cell.fill = styles["header_fill"]
+        header_cell.alignment = styles["header_align"]
+        header_cell.border = styles["thin_border"]
 
     # Write message in row 2, merged across all columns.
     msg_cell = ws.cell(row=2, column=1)
@@ -179,7 +257,7 @@ def _write_empty_sheet(
             cell.border = styles["thin_border"]
 
     for col_idx, header_cell in enumerate(ws[1], start=1):
-        width = min(len(str(header_cell.value)) + 2, wrap_threshold * 2)
+        width = min(len(str(header_cell.value)) + 2, max_width)
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
 
@@ -192,8 +270,15 @@ def _ensure_sheet_names(
     dfs: List[pd.DataFrame], sheet_names: Optional[List[str]]
 ) -> List[str]:
     """
-    Ensure sheet_names list matches the number of DataFrames.
-    Fills missing names with 'Sheet1', 'Sheet2', etc.
+    Ensure sheet_names list matches the number of DataFrames, and that every
+    resulting name is valid and unique for Excel.
+
+    Missing names are filled with 'Sheet1', 'Sheet2', etc. Every name
+    (whether supplied or auto-generated) is then sanitized: invalid
+    characters (`: \\ / ? * [ ]`) are replaced with underscores, and
+    names longer than 31 characters are trimmed to fit (a message is
+    printed when this happens). Duplicate names are de-duplicated with a
+    numeric suffix.
     """
     final_names = list(sheet_names or [])
     num_dfs = len(dfs)
@@ -201,7 +286,19 @@ def _ensure_sheet_names(
     for i in range(len(final_names), num_dfs):
         final_names.append(f"Sheet{i+1}")
 
-    return final_names[:num_dfs]
+    final_names = final_names[:num_dfs]
+
+    sanitized: List[str] = []
+    used: set = set()
+    for i, name in enumerate(final_names):
+        clean = _sanitize_sheet_name(str(name), i)
+        unique = _unique_sheet_name(clean, used)
+        if unique != clean:
+            print(f"Sheet name '{clean}' is a duplicate; renamed to '{unique}'")
+        used.add(unique)
+        sanitized.append(unique)
+
+    return sanitized
 
 
 def _validate_highlight_cols(
@@ -234,6 +331,7 @@ def save_formatted_excel(
     highlight_cols_list: Optional[List[Optional[List[str]]]] = None,
     freeze_header: bool = False,
     wrap_threshold: int = 40,
+    max_width: int = 100,
     as_table: bool = False,
     table_style: str = _DEFAULT_TABLE_STYLE,
     auto_fit_row_heights: bool = False,
@@ -249,36 +347,52 @@ def save_formatted_excel(
 
     Args:
         dfs (List[pd.DataFrame]): DataFrames to write; one per sheet.
-        output_path (Union[str, Path]): Destination ``.xlsx`` file path
-            (e.g. ``"report.xlsx"`` or a ``Path``).
+        output_path (Union[str, Path]): Destination `.xlsx` file path
+            (e.g. `"report.xlsx"` or a `Path`).
         sheet_names (Optional[List[str]]): Worksheet names. If `None` or shorter than
-            dfs, defaults like "Sheet1", "Sheet2" are used.
+            dfs, defaults like "Sheet1", "Sheet2" are used. Names longer than Excel's
+            31-character limit cannot be used as-is: a message is printed and the name
+            is trimmed to fit. Invalid characters (`: \\ / ? * [ ]`) are replaced
+            with underscores, and duplicate names are de-duplicated with a numeric
+            suffix.
         highlight_cols_list (Optional[List[Optional[List[str]]]], optional):
             Per-sheet list of column names whose data cells should receive the same
             light-blue fill as the header.
 
-            Pass ``None`` or an empty list for sheets that need no highlighting.
+            Pass `None` or an empty list for sheets that need no highlighting.
             Defaults to `None` no highlighting.
         freeze_header (bool, optional): Freeze the first row so headers stay
             visible while scrolling. Defaults to `False`.
         wrap_threshold (int, optional): Column-width threshold (Excel character units)
-            above which body cells receive ``wrap_text=True``. Defaults to `40`.
+            above which body cells receive `wrap_text=True`. Defaults to `40`.
+        max_width (int, optional): Hard ceiling for any column width. Defaults to `100`.
         as_table (bool, optional): Convert each sheet's data range to a native
             Excel Table (banded rows, built-in filter dropdowns). Defaults to `False`.
-        table_style (str, optional): Excel Table style name, e.g. ``"TableStyleMedium2"``.
-            Only used when *as_table* is ``True``. Defaults to `_DEFAULT_TABLE_STYLE`.
+
+            Note: sheets with zero data rows are written via a "no data" placeholder
+            and are never converted to a Table, even if *as_table* is `True`.
+        table_style (str, optional): Excel Table style name, e.g. `"TableStyleMedium2"`.
+            Only used when *as_table* is `True`. Defaults to `_DEFAULT_TABLE_STYLE`.
         auto_fit_row_heights (bool, optional): Apply heuristic row-height adjustment
             for rows containing wrapped text. Defaults to `False`.
-        show_gridlines (bool, optional): Show (``True``) or hide (``False``)
+        show_gridlines (bool, optional): Show (`True`) or hide (`False`)
             sheet gridlines. Defaults to `True`.
         add_filters (bool, optional): Add AutoFilter dropdowns to the header row when
-            *as_table* is ``False``.
+            *as_table* is `False`.
 
-            Ignored when *as_table* is ``True``
-            (tables include filters automatically). Defaults to `False`.
+            Ignored when *as_table* is `True` (tables include filters automatically),
+            and has no effect on sheets with zero data rows. Defaults to `False`.
 
     Raises:
         ValueError: If *highlight_cols_list* has a different length than *dfs*.
+
+    Note:
+        For performance, column-width auto-fit samples at most 1000 values per
+        column (uniformly at random, `random_state=42`) when computing the
+        best-fit width. On very large columns (>1000 non-null rows) this means
+        the single longest value can occasionally fall outside the sample,
+        which may result in a slightly narrower column than a full scan would
+        produce.
 
     Examples
     --------
@@ -326,11 +440,12 @@ def save_formatted_excel(
 
                 # ---- Empty DataFrame ----
                 if nrows == 0:
-                    _write_empty_sheet(ws, ncols, styles, wrap_threshold)
+                    _write_empty_sheet(ws, ncols, styles, max_width)
                     continue
 
                 # ---- Header styling & column widths ----
                 wrapped_col_indices: List[int] = []
+                wrapped_col_widths: Dict[int, float] = {}
 
                 filter_active = as_table or add_filters
                 filter_padding = _FILTER_ICON_WIDTH if filter_active else 0.0
@@ -341,10 +456,9 @@ def save_formatted_excel(
                     header_cell.alignment = styles["header_align"]
                     header_cell.border = styles["thin_border"]
 
-                    # series = df.iloc[:, col_idx - 1] if not df.empty else pd.Series()
                     series = df.iloc[:, col_idx - 1]
                     width = _calc_column_width(
-                        series, str(header_cell.value), max_width=wrap_threshold * 2
+                        series, str(header_cell.value), max_width=max_width
                     )
                     ws.column_dimensions[get_column_letter(col_idx)].width = (
                         width + filter_padding
@@ -352,6 +466,7 @@ def save_formatted_excel(
 
                     if width >= wrap_threshold:
                         wrapped_col_indices.append(col_idx)
+                        wrapped_col_widths[col_idx] = width
                         for row in ws.iter_rows(
                             min_row=2,
                             min_col=col_idx,
@@ -375,12 +490,12 @@ def save_formatted_excel(
                             ]
 
                 # ---- Heuristic row heights ----
-                if auto_fit_row_heights and wrapped_col_indices:
+                if auto_fit_row_heights and wrapped_col_widths:
                     _apply_wrap_row_heights(
                         ws,
                         min_row=2,
                         max_row=nrows + 1,
-                        wrap_cols=wrapped_col_indices,
+                        wrap_col_widths=wrapped_col_widths,
                     )
 
                 # ---- Excel Table or plain AutoFilter ----
@@ -401,6 +516,8 @@ def save_formatted_excel(
                         showColumnStripes=False,
                     )
                     ws.add_table(tab)
+
+                    _apply_header_styles(ws, ncols, styles)
 
                 elif add_filters:
                     ws.auto_filter.ref = f"A1:{get_column_letter(ncols)}{nrows + 1}"
