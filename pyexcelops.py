@@ -72,12 +72,14 @@ def _calc_column_width(
     """Return a best-fit column width in Excel character units, capped at `max_width`.
 
     The width is driven by the longest value in the column or the header,
-    whichever is wider.
+    whichever is wider. Blank values are ignored.
     """
-    if series.empty:
+    values = series.dropna()
+
+    if values.empty:
         return min(len(header) + padding, max_width)
 
-    max_len = max(series.astype(str).str.len().max(), len(header))
+    max_len = max(int(values.astype(str).str.len().max()), len(header))
     return min(max_len + padding, max_width)
 
 
